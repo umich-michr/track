@@ -1,0 +1,100 @@
+---
+mavenPackagingType: war
+
+# This is your current group ID in Gitlab and
+# will be used to download the generated war file
+gitlabGroupId: "10726"
+hitsLocation: openshift
+
+# These "enabled" containers
+# are like enabling/disabling
+# functionality in campsites
+enabledContainers:
+  # download a war file from gitlab before the container starts
+  - download-war
+  # add the downloaded war to tomcat
+  - tomcat
+  # provide Dockerfile to do TLS and OIDC (authn and authz (if needed))
+  - Dockerfile
+
+enabledVolumes:
+  - name: oidc-license-file-for-redis
+    secret:
+      secretName: oidc-license-file-for-redis
+
+# Openshift has some interesting requirements about non-root access.
+# These are taken into use with the following setup
+apacheRepository: registry-prod.app.med.umich.edu/devops/sds-containers/httpd-mod-jk
+apacheImageTag: highports
+appContainerPort: 8443
+apachePort: 8443
+# Apache modules need to know it's port 443 on the outside
+# (ie through the Citrix ADC/Netscaler)
+apacheCustomSSLConfig: |
+  RequestHeader set X-Forwarded-Port 443 early
+apacheCommands:
+  - /bin/sh
+  - '-c'
+  - >-
+    echo 'Include conf/extra/hits/hits-httpd-additions.conf' >>
+    /usr/local/apache2/conf/httpd.conf
+    && httpd-foreground
+
+
+# This log line matches Software Delivery's existing logs
+apacheCustomLogLine: >-
+  %{X-Forwarded-For}i %l %u %t '%r' %>s %b '%{Referer}i' '%{User-Agent}i' %D
+
+# Using a "blessed" image in openshift
+# to download the war file during the container startup
+downloadWarRepository: registry-prod.app.med.umich.edu/devops/sds-containers/gcloud-terrible
+downloadWarImageTag: "latest"
+
+# The tomcat version that should be in use
+tomcatRepository: registry-prod.app.med.umich.edu/devops/sds-containers/the-red-keep/tomcat
+
+# the following 2 lines should be in lock-step, eg move to tomcat11 requires both to change to "11"
+tomcatImageTag: "11-jdk21"
+tomcatMajorVersion: "11"
+
+# Some generic configuration for Openshift vs. GCP campsites
+# Devops already creates a service account
+# as part of campsites
+serviceAccount:
+  create: false
+
+# In openshift, the service
+# is internal to cluster
+service:
+  type: ClusterIP
+
+# turn off GCP-specific campsite
+# settings
+iap:
+  enabled: false
+ingress:
+  enabled: false
+
+# Each application will have it's own
+# "route" in openshift.  This will
+# correspond to a "/applicationname"
+# and is configured in each application's
+# "value.yaml"
+openshift_route:
+  enabled: true
+  annotations:
+    haproxy.router.openshift.io/set-forwarded-headers: never
+
+# OIDC configuration (some items here must match
+# each other across all environments)
+apacheOIDCEnabled: true
+
+# The RedirectURI must match what is configured at our identity provider
+apacheOIDCRedirectURIPath: /oidc/valid
+apacheOIDCConfKeys:
+  OIDCCookie: mod_auth_openidc
+  OIDCXForwardedHeaders: X-Forwarded-Port X-Forwarded-Host
+apacheVolumeMounts:
+  - name: oidc-license-file-for-redis
+    mountPath: /usr/local/apache2/conf/mod_auth_openidc.lic
+    subPath: mod_auth_openidc.lic

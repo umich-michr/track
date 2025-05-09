@@ -1,0 +1,146 @@
+import org.owasp.dependencycheck.reporting.ReportGenerator
+
+plugins {
+    id 'java'
+    id 'war'
+    id 'maven-publish'
+    id 'org.springframework.boot' version '3.4.4'
+    id 'io.spring.dependency-management' version '1.1.7'
+    id 'org.owasp.dependencycheck' version '12.1.1'
+}
+
+ext {
+    // These are documented here: https://docs.gitlab.com/ci/variables/predefined_variables/
+    repository_username = System.env.GITLAB_USER_LOGIN
+    repository_password = System.env.CI_JOB_TOKEN
+    ci_project_id = System.env.CI_PROJECT_ID
+}
+
+group = 'edu.umich.med.michr'
+version = '0.0.1-SNAPSHOT'
+
+dependencyCheck {
+    nvd.apiKey = project.findProperty("nvdApiKey")
+    analyzers.retirejs.enabled = false //a bug with dependency check was causing analyze task to fail: https://github.com/jeremylong/DependencyCheck/issues/1394
+    formats = [ReportGenerator.Format.XML.toString(), ReportGenerator.Format.HTML.toString()]
+    failBuildOnCVSS = 0
+    scanConfigurations = scanConfigurations = ['runtimeClasspath', 'implementation', 'runtimeOnly', 'compileClasspath']
+}
+
+publishing {
+    publications {
+        library(MavenPublication) {
+            artifact(tasks.war) {
+                builtBy tasks.war
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = 'gitlab'
+            url = 'https://git.umms.med.umich.edu/api/v4/projects/' + ci_project_id + '/packages/maven'
+            credentials(HttpHeaderCredentials) {
+                name = "Job-Token"
+                value = repository_password
+            }
+            authentication {
+                header(HttpHeaderAuthentication)
+            }
+        }
+    }
+}
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+bootRun {
+    systemProperties = [
+            'spring.profiles.active': System.getProperty('spring.profiles.active', System.getenv('SPRING_PROFILES_ACTIVE') ?: 'dev')
+    ]
+}
+
+war {
+    archiveClassifier.set('')
+//    rootSpec.exclude {
+//        it.file.name.contains('h2') || it.file.name.contains('spring-boot-devtools')
+//    }
+}
+bootWar {
+    enabled = false // disabled for the ease of deployment only the conventional war file is to be deployed
+    archiveClassifier.set('boot')
+}
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.oracle.database.jdbc:ojdbc11:23.7.0.25.01'
+    implementation 'com.oracle.database.jdbc:ucp:23.7.0.25.01'
+
+    // Exclude Spring Boot’s default logging (Logback)
+    implementation('org.springframework.boot:spring-boot-starter-web') {
+        exclude group: 'org.springframework.boot', module: 'spring-boot-starter-logging'
+    }
+
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'jakarta.inject:jakarta.inject-api:2.0.1'
+
+    // Use only Log4j2 for logging
+    implementation 'org.springframework.boot:spring-boot-starter-log4j2'
+
+    // SLF4J to Log4j2 Bridge - **KEEP ONLY THIS**
+    implementation 'org.apache.logging.log4j:log4j-slf4j2-impl:2.24.3'
+
+    // REMOVE log4j-to-slf4j (which causes conflicts)
+    configurations {
+        configureEach {
+            exclude group: 'org.apache.logging.log4j', module: 'log4j-to-slf4j'
+            exclude group: 'ch.qos.logback', module: 'logback-classic'
+        }
+    }
+
+    // Development dependencies
+    developmentOnly 'com.h2database:h2'
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+
+    providedRuntime 'org.springframework.boot:spring-boot-starter-tomcat'
+
+    // Testing dependencies
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'com.h2database:h2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    systemProperty 'spring.profiles.active', 'test'
+    //If you like tests to run even if when they are not changed since the last run uncomment the following line
+    //outputs.upToDateWhen { false }
+}
+
+bootRun {
+    if (project.hasProperty('env')) {
+        systemProperty 'env', project.property('env')
+    }
+}
+
+test {
+    //java agent config is for mockito, byte-buddy-agent has to be in the path
+    jvmArgs "-javaagent:${configurations.testRuntimeClasspath.find { it.name.contains('byte-buddy-agent') }}"
+    testLogging {
+        events = ["passed", "skipped", "failed", "standardOut", "standardError"]
+        showExceptions = true
+        exceptionFormat = "full"
+        showCauses = true
+        showStackTraces = true
+
+        // Display a summary after tests complete
+        afterSuite { desc, result ->
+            if (!desc.parent) { // will match the outermost suite
+                println "\nTest Results: ${result.resultType} (${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped)"
+            }
+        }
+    }
+}

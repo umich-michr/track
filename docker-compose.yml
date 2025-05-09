@@ -1,0 +1,39 @@
+services:
+  apache:
+    build:
+      context: ./docker/apache
+      dockerfile: Dockerfile
+      args:
+        LISTEN_HTTP_PORT: ${APACHE_HTTP_PORT}
+        LISTEN_HTTPS_PORT: ${APACHE_HTTPS_PORT}
+        APACHE_AJP_PORT: ${APACHE_AJP_PORT}
+        APACHE_AJP_SECRET: ${TOMCAT_AJP_SECRET}
+        DOCKER_HTTPS_PORT: ${DOCKER_HTTPS_PORT} #to be able to pass env var to apache docker file as
+    container_name: apache-reverse-proxy
+    ports:
+      - "${DOCKER_HTTP_PORT}:${APACHE_HTTP_PORT}"
+      - "${DOCKER_HTTPS_PORT}:${APACHE_HTTPS_PORT}"
+    networks:
+      - track-network
+
+  tomcat:
+    build:
+      context: . # Set context to the root of the project
+      dockerfile: ./docker/tomcat/Dockerfile
+      args:
+        APACHE_AJP_PORT: ${APACHE_AJP_PORT}
+        APACHE_AJP_SECRET: ${TOMCAT_AJP_SECRET}
+        SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
+        DB_URL: ${DB_URL}
+        DB_USERNAME: ${DB_USERNAME}
+        DB_PASSWORD: ${DB_PASSWORD}
+    container_name: tomcat-app
+    expose: # Makes the AJP port accessible to other containers within the track-network. It does not bind the port to the host (e.g., localhost). Does not expose the port to the host.
+      - "${APACHE_AJP_PORT}"
+    networks:
+      - track-network
+
+networks:
+  track-network:
+    name: track-network
+    driver: bridge

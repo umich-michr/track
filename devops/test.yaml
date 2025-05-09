@@ -1,0 +1,40 @@
+---
+releases:
+- name: yhrtrack-test
+  # defined in the pipeline (.gitlab-ci.yml)
+  namespace: {{ requiredEnv "HITS_CAMPSITE" }}
+  chart: hits_devops/hits-site
+  # "version" is defined in the pipeline .gitlab-ci.yml
+  version: {{ requiredEnv "HITS_CAMPSITE_CHART_VERSION" }}
+  installed: true
+  values:
+    - common-values.yaml
+    # the maven artifact identification
+    # Change the following 4 lines to match your pom.xml
+    - mavenGroupId: edu.umich.med.michr
+    - mavenArtifactId: track
+    # Change the following line to some variable like {{ requiredEnv "PROJECT_VERSION" }}
+    - mavenVersion: 0.0.1-SNAPSHOT
+    - mavenFileName: track.war
+    - pipelineID: {{ requiredEnv "CI_PIPELINE_ID" | quote }}
+    # application specific values
+    - appDomainName: yhrtrack.test.app.med.umich.edu
+    - apacheOIDCConfKeys:
+        OIDCCookieDomain: yhrtrack.test.app.med.umich.edu
+    - apacheOIDCProtectRoot: false
+    - apacheOIDCLocations:
+        - location: /
+          protected: true
+          require: claim edumember_is_member_of:hits-oidc-michr-developers
+    - appStatusCheck: /
+    - apacheCustomVHostConfig: |
+        RedirectMatch ^/$ /track/hello
+
+helmDefaults:
+  createNamespace: false
+repositories:
+- name: hits_devops
+  url: https://git.umms.med.umich.edu/api/v4/projects/4852/packages/helm/stable
+  username: gitlab-ci-token
+  password: {{ requiredEnv "CI_JOB_TOKEN" }}
+

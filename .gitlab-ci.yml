@@ -1,0 +1,1171 @@
+# use below gradle image for all jobs by default
+image: gradle:8.13.0-jdk21
+default:
+  tags:
+    - shared
+#-------------------------------------------------- STAGES -----------------------------------------------#
+stages:
+  - mirror
+  - vulnerability_scan
+  - vulnerability_severity_check
+  - liquibase_update
+  - setup
+  - test
+  - sonar
+  - build
+  - push_to_registry
+  - deploy
+  - release
+#-------------------------------------------------- EXTERNAL TEMPLATES -----------------------------------------------#
+
+
+include:
+  # This adds deployment mechanisms for HITS Devops campsites.
+  # Source code: https://git.umms.med.umich.edu/devops/hits-gitlab/autodevops/-/blob/master/campsite.continuousdelivery.gitlab-ci.yml
+  - project: 'devops/hits-gitlab/autodevops'
+    file:
+      - "campsite.continuousdelivery.gitlab-ci.yml"
+    ref: master
+
+#-------------------------------------------------- GLOBAL VARIABLES-----------------------------------------------#
+variables:
+  # umich variables
+  UMICH: "umich"
+  # umich test jobs will run when you push your code in this branch or tag
+  # however, if you push a tag starting with 'release-*' umich test jobs won't run
+  UMICH_WILL_RUN_ON_THIS_BRANCH_OR_TAG: "master"
+  # allows you to choose if umich prod jobs should run when you push a tag starting with 'release-*'
+  UMICH_WILL_RUN_ON_PRODUCTION: "true"
+
+  # itm variables
+  ITM: "itm"
+  # itm test jobs will run when you push your code in this branch or tag
+  # however, if you push a tag starting with 'release-*' itm test jobs won't run
+  ITM_WILL_RUN_ON_THIS_BRANCH_OR_TAG: "master"
+  # allows you to choose if itm prod jobs should run when you push a tag starting with 'release-*'
+  ITM_WILL_RUN_ON_PRODUCTION: "true"
+
+  # umiami variables
+  UMIAMI: "umiami"
+  # umiami test jobs will run when you push your code in this branch or tag
+  # however, if you push a tag starting with 'release-*' umiami test jobs won't run
+  UMIAMI_WILL_RUN_ON_THIS_BRANCH_OR_TAG: "master"
+  # allows you to choose if umiami prod jobs should run when you push a tag starting with 'release-*'
+  UMIAMI_WILL_RUN_ON_PRODUCTION: "true"
+
+  # uic variables
+  UIC: "uic"
+  # uic test jobs will run when you push your code in this branch or tag
+  # however, if you push a tag starting with 'release-*' uic test jobs won't run
+  UIC_WILL_RUN_ON_THIS_BRANCH_OR_TAG: "master"
+  # allows you to choose if uic prod jobs should run when you push a tag starting with 'release-*'
+  UIC_WILL_RUN_ON_PRODUCTION: "true"
+
+  # demo variables
+  DEMO: "demo"
+  # demo test jobs will run when you push your code in this branch or tag
+  # however, if you push a tag starting with 'release-*' demo test jobs won't run
+  DEMO_WILL_RUN_ON_THIS_BRANCH_OR_TAG: "master"
+  # allows you to choose if demo prod jobs should run when you push a tag starting with 'release-*'
+  DEMO_WILL_RUN_ON_PRODUCTION: "true"
+
+  # controls the log level of gitlab's security analyzers
+  # Accepted values: fatal, error, warn, info(default), debug
+  SECURE_LOG_LEVEL: ""
+  #------ Devops Deployment Variables--------------#
+  HELMFILE_VERSION: "0.156.0"
+  # Change the following value to the latest version here to take latest devops code:
+  # https://git.umms.med.umich.edu/devops/hits-gitlab/hits-site/-/releases
+  HITS_CAMPSITE_CHART_VERSION: v1.1.5
+
+  HITS_CAMP_CONFIG_PROJECT: michr/hits-devops-camp-config
+
+  # Lab env setup (modify for your particular campsite)
+  HITS_CAMPSITE_LAB: hitsos-michr-yhrtrack-lab
+  HITS_CAMP_AGENT_LAB: hitsos-michr-devops
+
+  HITS_CAMPSITE_TEST: hitsos-michr-yhrtrack-test
+  HITS_CAMP_AGENT_TEST: hitsos-michr-devops
+  HITS_CAMPSITE_PROD: hitsos-michr-yhrtrack-prod
+  HITS_CAMP_AGENT_PROD: hitsos-michr-devops
+
+  # disable campsite docker builds because
+  # we run a maven deploy to tomcat instead
+  DOCKER_FILE_NAME: ""
+  HITS_DEPLOY: full
+  CONTAINER_SCANNING_DISABLED: true
+
+  # JFIXME: remove this after deployment process approved
+  HITS_DEPLOY_BRANCH: DO-4261-CAMPsite-deployment
+
+  # Do not let the pipeline complete successfully
+  # until the application is up and running,
+  # passing its status checks.
+  HITS_VERIFY_DEPLOYMENT: pipeline-id
+
+
+
+##-------------------------------------------------- REUSABLE CODE BLOCKS -----------------------------------------------#
+#
+## reusable code block to get variables related to an INSTITUTION dynamically
+#.get_institution_variables:
+#  &get_institution_variables # Throw error if INSTITUTION is not present.
+#  - |
+#    if [ -z "${INSTITUTION}" ]; then
+#      echo "INSTITUTION not set. Exiting."
+#      exit 1
+#    fi
+#
+#  # Our global variables are all upper-case. So, we need to capitalize the INSTITUTION value before dynamically using those variables
+#  - CAPITALIZED_INSTITUTION=$(echo "${INSTITUTION}" | tr '[:lower:]' '[:upper:]')
+#
+#  - |
+#
+#    # using ! sign for indirect variable expansion. Example: when INSTITUTION=UMICH, DEPLOY_SERVER_VAR = UMICH_TEST_SERVER. But we want the value of UMICH_TEST_SERVER, not the name itself. ! sign helps to get the correct value.
+#    if [ "${BUILD_TYPE}" = "PROD" ]; then
+#      # this file will be pulled from package registry in prod_deploy_template deployed to prod servers in base_deploy_template
+#      FILE_TO_DEPLOY="${PROJECT_NAME}-${DEPLOY_VERSION}.war"
+#    else
+#      # this file will be pulled from artifacts directory  and deployed to test servers in base_deploy_template
+#      FILE_TO_DEPLOY="${WAR_DIRECTORY}/${TEST_WAR_FILE_NAME}"
+#    fi
+#
+#  # getting DEPLOY_SERVER based on INSTITUTION and BUILD_TYPE
+#  - DEPLOY_SERVER_VAR="${CAPITALIZED_INSTITUTION}_${BUILD_TYPE}_SERVER"
+#  - DEPLOY_SERVER="${!DEPLOY_SERVER_VAR}"
+#
+## reusable code block to execute curl command and exit if any error
+.execute_curl: &execute_curl
+  - |
+
+    # check if there is CURL_COMMAND
+    if [ -z "${CURL_COMMAND}" ]; then
+      echo "CURL_COMMAND not set. Exiting."
+      exit 1
+    fi
+
+    # check if there is SUCCESS_STATUS. If not, then set default success status to 200
+    if [ -z "${SUCCESS_STATUS}" ]; then
+      SUCCESS_STATUS=200
+    fi
+
+  # executing curl command and storing the response in a variable
+  # -w specifies the custom output format to print the HTTP status code at the end of line
+  # -v provides more information about request and response.
+  - CURL_RESPONSE=$(eval "${CURL_COMMAND} -vw '%{http_code}'")
+  - echo "CURL_RESPONSE:${CURL_RESPONSE}"
+
+  # Extracting only the last line as it contains the actual response data and http status code (because of -w in curl command)
+  - LAST_LINE=$(echo "${CURL_RESPONSE}" | tail -n 1)
+  # - echo "LAST_LINE:${LAST_LINE}"
+
+  # {}: These curly braces contain the action to be performed.
+  # print substr($0, length($0)-2): This is the action to print the result. Here's what each part does:
+  # substr($0, length($0)-2): This function extracts a substring from the input line ($0). It takes two arguments:
+  # $0: This tells substring to process the input line
+  # length($0)-2: This calculates the position from which to start the substring, two characters before the end.
+  # The result is the last 3 characters of the input line.
+  # The last 3 characters is the http status because the CURL_COMMAND that is passed will have -w to always write http_code at the end of the output
+  - HTTP_STATUS=$(echo "${LAST_LINE}" | awk '{print substr($0, length($0)-2)}')
+  - echo "HTTP_STATUS:${HTTP_STATUS}"
+
+  # we will use RESPONSE_BODY in the job that called execute_curl template if necessary for further processing
+  # Here we are processing the last line and getting substring from 1st character to length-3 character which is the character just before http status code
+  - RESPONSE_BODY=$(echo "${LAST_LINE}" | awk '{print substr($0, 1, length($0)-3)}')
+  - echo "RESPONSE_BODY:${RESPONSE_BODY}"
+
+  - |
+
+    # In Bash scripting, the =~ operator is used for regular expression matching. When used within double square brackets [[ ... ]], it allows you to check if a string on the left side matches the pattern on the right side.
+    # Checks if HTTP_STATUS is an integer  
+    if [[ ! ${HTTP_STATUS} =~ ^[0-9]+$ ]]; then
+      echo "Error: HTTP status is not a number: ${HTTP_STATUS}"
+      exit 1
+    fi
+
+    # If HTTP_STATUS from curl response doesn't match the SUCCESS_STATUS, we throw an error
+    if [ ${HTTP_STATUS} -ne ${SUCCESS_STATUS} ]; then
+      echo "Error: Curl command failed with HTTP Status Code: ${HTTP_STATUS}"
+      exit 1
+    fi
+
+#-------------------------------------------------- VULNERABILITY SEVERITY CHECK TEMPLATE-----------------------------------------------#
+
+# template to check if the severity of the detected vulnerability is high or critical
+.vulnerability_severity_check_template:
+  stage: vulnerability_severity_check
+  before_script:
+    # Update local package index with info about newest version of packages and their dependencies
+    - apt-get update
+    # install jq for parsing the json response
+    - apt-get install -y jq
+  script:
+    # check if there is SECURITY_ANALYZER_TYPE
+    - |
+      if [ -z "${SECURITY_ANALYZER_TYPE}" ]; then
+        echo "SECURITY_ANALYZER_TYPE not set. Exiting."
+        exit 1
+      fi
+
+    # Calling GraphQL API to get the vulnerabilities for certain severity and type
+
+    # data-raw defines the graphql query. We are sending a query for project "michr/your-health-research/yhr-backend" to find vulnerabilities with critical or high severity under SECURITY_ANALYZER_TYPE and which are in a DETECTED state. We further declare that we only need id of such vulnerabilities.
+    # GROUP_ACCESS_TOKEN is configured in Gitlab Variable
+    - |
+      CURL_COMMAND='curl \
+        --request POST \
+        --url ${CI_API_GRAPHQL_URL} \
+        --header "PRIVATE-TOKEN:${GROUP_ACCESS_TOKEN}" \
+        --header "Content-Type:application/json" \
+        --data-raw "{ \
+            \"query\": \
+              \"query{ \
+                project(fullPath:\\\"${GROUP_NAME}/${SUB_GROUP_NAME}/${CI_PROJECT_NAME}\\\") \
+                { \
+                  vulnerabilities(severity:[CRITICAL, HIGH], reportType:${SECURITY_ANALYZER_TYPE}, state:DETECTED) \
+                  { \
+                    edges{ \
+                      node{id} \
+                    } \
+                  } \
+                } \
+              }\" \
+          }"'
+
+    # append scripts from execute_curl
+    - *execute_curl
+
+    # parse RESPONSE_BODY using jq and check if there are any vulnerabilities
+    - |
+
+      VULNERABILITIES_COUNT=$(echo $RESPONSE_BODY | jq -r '.data.project.vulnerabilities.edges | length')
+      echo "Number of critical or high severity vulnerabilities:${VULNERABILITIES_COUNT}"
+
+      if [ "$VULNERABILITIES_COUNT" -gt 0 ]; then
+        echo "Failing Job due to ${SECURITY_ANALYZER_TYPE} vulnerabilities with severity 'critical' or 'high'."
+        exit 1
+      else
+        echo "No ${SECURITY_ANALYZER_TYPE} vulnerabilities with severity 'critical' or 'high' found."
+      fi
+  rules:
+    # do not run this job if there is any tag because current version of security templates don't run if tagged, so running this job is pointless
+    - if: $CI_COMMIT_TAG
+      when: never
+    # run job manually if MANUAL_TRIGGER is true
+    - if: "$MANUAL_TRIGGER =~ /true/i"
+      when: manual
+      # When this job is set to run manually, other jobs will run without waiting for this job to be triggered
+      allow_failure: true
+    #else run if jobs in previous stage passes
+    - when: on_success
+  allow_failure: true
+  # except:
+  # - /^release-.*$/ #do not run this job if there is a release tag
+
+
+#-------------------------------------------------- DEPLOY TEMPLATES------------------------------------------------#
+
+# base template for deployment
+.base_deploy_template:
+  stage: deploy
+  script:
+    - |
+
+      # fail job if MICHR_JENKINS_USERNAME does not exist  
+      if [ -z "${MICHR_JENKINS_USERNAME}" ]; then
+        echo "MICHR_JENKINS_USERNAME not set. Exiting."
+        exit 1
+      fi
+      # fail job if MICHR_JENKINS_PASSWORD does not exist        
+      if [ -z "${MICHR_JENKINS_PASSWORD}" ]; then
+        echo "MICHR_JENKINS_PASSWORD not set. Exiting."
+        exit 1
+      fi
+      # fail job if CERTIFICATE_FILE does not exist        
+      if [ -z "${CERTIFICATE_FILE}" ]; then
+        echo "CERTIFICATE_FILE not set. Exiting."
+        exit 1
+      fi
+
+    # Undeploy existing application (if it exists)
+    # tomcat is configured to use http1.1 in our server, so we have to manually tell curl to use http1.1
+    # --cacert is used to pass the certificate in the request. We have already mapped the certificate file to docker volume in michr-ap-ps7a in config.toml. ${CERTIFICATE_FILE} comes from gitlab variable which has path to the certificate file
+    - |
+      CURL_COMMAND='curl --http1.1 \
+        --request GET \
+        -u ${MICHR_JENKINS_USERNAME}:${MICHR_JENKINS_PASSWORD} \
+        "https://${DEPLOY_SERVER}:8443/manager/text/undeploy?path=/backend"'
+#        --cacert ${CERTIFICATE_FILE}'
+
+    # append scripts from execute_curl
+    - *execute_curl
+
+    # deploy new application
+    - |
+      CURL_COMMAND='curl --http1.1 \
+        --request PUT \
+        -u ${MICHR_JENKINS_USERNAME}:${MICHR_JENKINS_PASSWORD} \
+        -T ${FILE_TO_DEPLOY} \
+        "https://${DEPLOY_SERVER}:8443/manager/text/deploy?path=/backend"'
+#        --cacert ${CERTIFICATE_FILE}'
+
+    # append scripts from execute_curl
+    - *execute_curl
+
+## deployment template for test
+#.test_deploy_template:
+#  # extends base_deploy_template
+#  extends:
+#    # extends base_deploy_template
+#    - .base_deploy_template
+#  needs:
+#    # needs access to environment variables set in this job
+#    - setup
+#    #  needs war file in local build/libs directory
+#    - gradle_build
+#  before_script:
+#    # BUILD_TYPE is needed in get_insitituion_variables template below
+#    - BUILD_TYPE=TEST
+#
+#    # append scripts from get_institution_variables
+#    - *get_institution_variables
+#
+## deployment template for prod
+#.prod_deploy_template:
+#  # extends base_deploy_template
+#  extends:
+#    # extends base_deploy_template
+#    - .base_deploy_template
+#  needs:
+#    # needs access to environment variables set in this job
+#    - setup
+#    #  needs the latest build to be pushed in gitlab's package registry
+#    - push_to_gitlab_registry
+#  before_script:
+#    # You need to set deploy_version or DEPLOY_VERSION when you manually run this job from Gitlab UI (project -> build -> pipeline)
+#    - |
+#
+#      # handle if lowercase deploy_version is sent as the env variable
+#      if [ "${deploy_version}" ]; then
+#        DEPLOY_VERSION=${deploy_version};
+#      # If DEPLOY_VERSION is empty, it assigns the value of GIT_TAG_VERSION to it.
+#      elif [ -z "${DEPLOY_VERSION}" ]; then
+#        DEPLOY_VERSION=${GIT_TAG_VERSION};
+#      fi
+#
+#      echo "Deploying Version: ${DEPLOY_VERSION}"
+#
+#    # BUILD_TYPE is needed in get_insitituion_variables below
+#    - BUILD_TYPE=PROD
+#
+#    # append scripts from get_institution_variables
+#    - *get_institution_variables
+#
+#    # curl command to pull deployment file from package repository
+#    - |
+#      CURL_COMMAND='curl --header "JOB-TOKEN:$CI_JOB_TOKEN" \
+#        --output "${FILE_TO_DEPLOY}" \
+#        "${PACKAGE_REGISTRY_URL}/${DEPLOY_VERSION}/${FILE_TO_DEPLOY}"'
+#
+#    # append scripts from execute_curl
+#    - *execute_curl
+#
+#    # putting deploy version to .env.example file to pass it to the release job
+#    - echo "${CAPITALIZED_INSTITUTION}_DEPLOY_VERSION=${DEPLOY_VERSION}" >> .env.example
+#  # makes DEPLOY_VERSION variable available to all jobs that depend on this job
+#  artifacts:
+#    reports:
+#      dotenv: .env.example
+
+#-------------------------------------------------- MIRROR REDMINE REPOSITORY--------------------------------------------------#
+
+## Updates redmine repository with latest gitlab commits
+#mirror_redmine:
+#  stage: mirror
+#  variables:
+#    # Gitlab project url with GROUP_ACCESS_TOKEN for authentication
+#    GITLAB_REPO: "https://oauth2:${GROUP_ACCESS_TOKEN}@${CI_SERVER_HOST}/${GROUP_NAME}/${SUB_GROUP_NAME}/${CI_PROJECT_NAME}"
+#    # Location of redmine repository on the server
+#    MIRROR_DEST: "${REDMINE_MIRROR_DEST}"
+#  script:
+#    # MIRROR_DEST is mapped as docker volume in config.toml
+#    - cd "${MIRROR_DEST}"
+#    - |
+#
+#      # check if directory named yhr-volunteer.git exists in the current working directory
+#      if [ -d "${CI_PROJECT_NAME}.git" ]; then
+#        # Repository exists, fetch updates
+#        cd "${CI_PROJECT_NAME}.git"
+#
+#        # Update the remote URL to use the latest token
+#        git remote set-url origin "${GITLAB_REPO}"
+#
+#        # Fetch updates from the remote repository
+#        git fetch origin --prune
+#      else
+#        # Repository doesn't exist, clone it
+#        git clone --mirror "${GITLAB_REPO}"
+#      fi
+#  # when: manual
+
+#-------------------------------------------------- VULNERABILITY SCANNING -----------------------------------------------#
+# Below tests are GitLab's security scanning jobs. We are overriding the default stage of each security job from test to vulnerability_scan.
+# Note: these security analyzers will not run on release.
+#dependency_scanning:
+#  stage: vulnerability_scan
+#  # when: manual
+#
+#sast:
+#  stage: vulnerability_scan
+#  # when: manual
+#
+#secret_detection:
+#  stage: vulnerability_scan
+#  variables:
+#    # passing this variable will exclude node_modules from the secret_detection
+#    SECRET_DETECTION_EXCLUDED_PATHS: node_modules
+#  # when: manual
+#
+##-------------------------------------------------- VULNERABILITY SEVERITY CHECK -----------------------------------------------#
+#dependency_scanning_severity_check:
+#  extends:
+#    # extends vulnerability_severity_check_template
+#    - .vulnerability_severity_check_template
+#  variables:
+#    SECURITY_ANALYZER_TYPE: "DEPENDENCY_SCANNING"
+#
+#secret_detection_severity_check:
+#  extends:
+#    # extends vulnerability_severity_check_template
+#    - .vulnerability_severity_check_template
+#  variables:
+#    SECURITY_ANALYZER_TYPE: "SECRET_DETECTION"
+#
+#sast_severity_check:
+#  extends:
+#    # extends vulnerability_severity_check_template
+#    - .vulnerability_severity_check_template
+#  variables:
+#    SECURITY_ANALYZER_TYPE: "SAST"
+
+#-------------------------------------------------- LIQUIBASE UPDATE-----------------------------------------------#
+
+## -----------------------TEST LIQUIBASE UPDATE----------------------#
+#umich_test_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${UMICH_TEST_DB_NAME}
+#    DB_USERNAME: ${UMICH_TEST_DB_USERNAME}
+#    DB_PASSWORD: ${UMICH_TEST_DB_PASSWORD}
+#  rules:
+#    #do not run job if there is a release tag
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/"
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the UMICH_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $UMICH_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#itm_test_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${ITM_TEST_DB_NAME}
+#    DB_USERNAME: ${ITM_TEST_DB_USERNAME}
+#    DB_PASSWORD: ${ITM_TEST_DB_PASSWORD}
+#  rules:
+#    #do not run job if there is a release tag
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/"
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the ITM_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $ITM_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#umiami_test_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${UMIAMI_TEST_DB_NAME}
+#    DB_USERNAME: ${UMIAMI_TEST_DB_USERNAME}
+#    DB_PASSWORD: ${UMIAMI_TEST_DB_PASSWORD}
+#  rules:
+#    #do not run job if there is a release tag
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/"
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the UMIAMI_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $UMIAMI_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#uic_test_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${UIC_TEST_DB_NAME}
+#    DB_USERNAME: ${UIC_TEST_DB_USERNAME}
+#    DB_PASSWORD: ${UIC_TEST_DB_PASSWORD}
+#  rules:
+#    #do not run job if there is a release tag
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/"
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the UIC_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $UIC_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#demo_test_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${DEMO_TEST_DB_NAME}
+#    DB_USERNAME: ${DEMO_TEST_DB_USERNAME}
+#    DB_PASSWORD: ${DEMO_TEST_DB_PASSWORD}
+#  rules:
+#    #do not run job if there is a release tag
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/"
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the DEMO_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $DEMO_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+## -----------------------PROD LIQUIBASE UPDATE----------------------#
+#umich_prod_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${UMICH_PROD_DB_NAME}
+#    DB_USERNAME: ${UMICH_PROD_DB_USERNAME}
+#    DB_PASSWORD: ${UMICH_PROD_DB_PASSWORD}
+#  rules:
+#    # run job if release tag is pushed and UMICH_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $UMICH_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#itm_prod_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${ITM_PROD_DB_NAME}
+#    DB_USERNAME: ${ITM_PROD_DB_USERNAME}
+#    DB_PASSWORD: ${ITM_PROD_DB_PASSWORD}
+#  rules:
+#    # run job if release tag is pushed and ITM_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $ITM_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#umiami_prod_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${UMIAMI_PROD_DB_NAME}
+#    DB_USERNAME: ${UMIAMI_PROD_DB_USERNAME}
+#    DB_PASSWORD: ${UMIAMI_PROD_DB_PASSWORD}
+#  rules:
+#    # run job if release tag is pushed and UMIAMI_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $UMIAMI_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#uic_prod_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${UIC_PROD_DB_NAME}
+#    DB_USERNAME: ${UIC_PROD_DB_USERNAME}
+#    DB_PASSWORD: ${UIC_PROD_DB_PASSWORD}
+#  rules:
+#    # run job if release tag is pushed and UIC_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $UIC_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+#demo_prod_liquibase_update:
+#  extends:
+#    # extends base_liquibase_update_template
+#    - .base_liquibase_update_template
+#  variables:
+#    TARGET_DB: ${DEMO_PROD_DB_NAME}
+#    DB_USERNAME: ${DEMO_PROD_DB_USERNAME}
+#    DB_PASSWORD: ${DEMO_PROD_DB_PASSWORD}
+#  rules:
+#    # run job if release tag is pushed and DEMO_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $DEMO_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+
+#-------------------------------------------------- SETUP -----------------------------------------------#
+
+# Job to download dependencies
+setup:
+  stage: setup
+  script:
+    - PROJECT_NAME=$(grep 'rootProject.name' settings.gradle | cut -d"'" -f2)
+    - PROJECT_VERSION=$(grep 'version =' build.gradle | cut -d"'" -f2)
+    - GIT_TAG_VERSION=$(git describe --tags --abbrev=0 --always | sed 's/^release-//')
+    - TEST_WAR_FILE_NAME="${PROJECT_NAME}-${PROJECT_VERSION}.war"
+    - PROD_WAR_FILE_NAME="${PROJECT_NAME}-${GIT_TAG_VERSION}.war"
+
+    # Put variables to .env.example file for other jobs to get access to these variables
+    - echo "PROJECT_NAME=${PROJECT_NAME}" >> .env.example
+    - echo "PROJECT_VERSION=${PROJECT_VERSION}" >> .env.example
+    - echo "GIT_TAG_VERSION=${GIT_TAG_VERSION}" >> .env.example
+    - echo "TEST_WAR_FILE_NAME=${TEST_WAR_FILE_NAME}" >> .env.example
+    - echo "PROD_WAR_FILE_NAME=${PROD_WAR_FILE_NAME}" >> .env.example
+    - echo "DOCKER_CONTAINER=true" >> .env.example
+    - echo "GRADLE_USER_HOME=${CI_PROJECT_DIR}/.gradle" >> .env.example
+    - echo "WAR_DIRECTORY=build/libs" >> .env.example
+    - echo "SONAR_AUTH_TOKEN=${SONAR_AUTH_TOKEN}" >> .env.example
+    - echo "PACKAGE_REGISTRY_URL=${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PROJECT_NAME}" >> .env.example
+  # makes above variables available to all jobs as environment variables
+  artifacts:
+    reports:
+      dotenv: .env.example
+  # when: manual
+
+#-------------------------------------------------- TEST-----------------------------------------------#
+
+check_git_tag_&_project_version:
+  stage: test
+  needs:
+    # We need PROJECT_VERSION defined in setup job
+    - setup
+  script:
+    - |
+
+      echo "Git Tag Version: ${GIT_TAG_VERSION}"
+      echo "Project Version: ${PROJECT_VERSION}"
+
+      # Check if tag has 'release-' prefix and if the tag version matches the project version
+      if [[ "${CI_COMMIT_TAG}" =~ ^release-.*$ && "${GIT_TAG_VERSION}" != "${PROJECT_VERSION}" ]]; then
+          echo "Error: Git tag version does not match your project version."
+          echo "Please make sure that the project version is up-to-date in your build.gradle file, and the tag that you push matches the project version."
+          exit 1
+      # If a tag doesn't have 'release-' prefix, just print warning
+      elif [[ ! "${CI_COMMIT_TAG}" =~ ^release-.*$ ]]; then
+          echo "Warning: There is no 'release-' prefix in your tag. Running the test pipeline."
+          echo "If you intend to push your code to production, please prefix your tag version with 'release-' keyword. Example: 'release-xx.xx.xx'. "
+      fi
+  rules:
+    # run this job if there is any tag
+    - if: $CI_COMMIT_TAG
+      when: on_success
+    # else never run this job
+    - when: never
+
+# Job to run gradlew test
+#gradle_test:
+#  stage: test
+#  needs:
+#    # We want to make env variables available to gradle_test because in redis.gradle we are checking for an env variable called DOCKER_CONTAINER which is defined in setup job
+#    - setup
+#    # we want to fail pipeline if git tag and project version doesn't match in release
+#    - job: check_git_tag_&_project_version
+#      optional: true
+#  before_script:
+#    # Update local package index with info about newest version of packages and their dependencies
+#    - apt-get update
+#    # install redis
+#    - apt-get install -y redis
+#  script:
+#    # Run tests
+#    - ./gradlew test
+#  after_script:
+#    - |
+#
+#      #Getting jacoco coverage report
+#      COVERAGE_REPORT="build/reports/jacoco/test/html/index.html"
+#
+#      # check if COVERAGE_REPORT points to a regular file and if it does then print its contents
+#      # we need to print the report in logs so that 'coverage' keyword below can parse the log to get the coverage percentage
+#      if [ -f "${COVERAGE_REPORT}" ]; then
+#        cat "${COVERAGE_REPORT}"
+#      else
+#        echo "JaCoCo Coverage Report not found"
+#      fi
+#  artifacts:
+#    # Uploads the reports even if the job fails
+#    when: always
+#    # Makes build folder downloadable from the job details page
+#    paths:
+#      - build
+#    # Visualize all test results on the test tab in pipeline details page
+#    reports:
+#      junit:
+#        - build/test-results/test/TEST-*.xml
+#    #removes artifacts in 1 week
+#    expire_in: 1 week
+#  # parses the output log and retrieves class coverage
+#  coverage: "/Total.*?([0-9]{1,3})%/"
+#  # when: manual
+
+# Job to run gradlew dependencyCheckAnalyze
+#gradle_dependency_check:
+#  stage: test
+#  needs:
+#    - setup
+#  # caching dependency-check-data to make this job run faster next time.
+#  # When running ./gradlew dependencyCheck,the files are created on:$GRADLE_USER_HOME/.gradle/dependency-check-data/7.0/nvdcache/
+#  cache:
+#    key:
+#      files:
+#        # When build.gradle changes, cache is recalculated because the owasp dependencyCheck version is set in plugins section of build.gradle
+#        - build.gradle
+#    paths:
+#      - "${GRADLE_USER_HOME}/dependency-check-data"
+#  script:
+#    # Run dependencyCheckAnalyze
+#    - ./gradlew -PnvdApiKey="${NVD_API_KEY}" dependencyCheckAnalyze
+#  artifacts:
+#    # Uploads the reports even if the job fails
+#    when: always
+#    # Makes dependencyCheck report folder downloadable from the job details page
+#    paths:
+#      - build/reports
+#    #removes artifacts in 1 week
+#    expire_in: 1 week
+#  rules:
+#    # if we are pushing release tag, fail pipeline as soon as this job fails
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      allow_failure: false
+#    # otherwise continue the pipeline even if this job fails
+#    - allow_failure: true
+#  # when: manual
+
+# GitLab expects the test report in the Cobertura format
+# This job converts the jacocoTestReport.xml file to cobertura.xml format
+# Gitlab can then display the coverage report in merge request, repository analytics etc
+# convert_test_report_to_cobertura:
+#   stage: test
+#   needs:
+#     - gradle_test
+#   # Dockerfile image to allow java projects that use jacoco to use the new codecoverage feature of gitlab. (https://gitlab.com/haynes/jacoco2cobertura)
+#   image: registry.gitlab.com/haynes/jacoco2cobertura:1.0.9
+#   script:
+#     # convert report from jacoco to cobertura, using relative project path
+#     - python /opt/cover2cover.py build/reports/jacoco/test/jacocoTestReport.xml $CI_PROJECT_DIR/src/main/java/ > build/cobertura.xml
+#   artifacts:
+#     reports:
+#       coverage_report:
+#         coverage_format: cobertura
+#         path: build/cobertura.xml
+#     expire_in: 1 week
+#   #   # parses the output log and retrieves class coverage
+#   # coverage: '/    - Class Coverage: ([0-9.]+)%/'
+
+#------------------------------------------------------------ SONAR--------------------------------------------------------#
+
+#sonar:
+#  stage: sonar
+#  needs:
+#    # gradle_test generates coverage report that is needed by sonar
+#    - gradle_test
+#    # gradle_dependency_check generates dependency check report which we might need in sonar if we want to setup the report display in sonar
+#    - gradle_dependency_check
+#  before_script:
+#    # Update local package index with info about newest version of packages and their dependencies
+#    - apt-get update
+#    # install jq for parsing the json response
+#    - apt-get install -y jq
+#
+#    # import certificate from host directory and add it to java keystore in CI environment
+#    # SONAR_CERTIFICATE_FILE is defined in GitLab CI/CD variable, the host directory is mapped as volume in config.toml file
+##    - keytool -importcert -keystore ${JAVA_HOME}/lib/security/cacerts -storepass ${JAVA_KEYSTORE_PASS} -file ${SONAR_CERTIFICATE_FILE}
+#  script:
+#    # skip test and dependencyCheckAnalyze task. Only sonar and check task will be run
+#    - ./gradlew sonar -x test -x dependencyCheckAnalyze
+#
+#    # curl command to check quality gate status
+#    # -u specifies the user. We pass SONAR_AUTH_TOKEN which is set in gitlab variable
+#    - |
+#      CURL_COMMAND='curl \
+#        -u ${SONAR_AUTH_TOKEN}: -G \
+#        --data-urlencode "branch=master" \
+#        --data-urlencode "projectKey=${SONAR_PROJECT_KEY}" \
+#        "${SONAR_HOST_URL}/api/qualitygates/project_status"'
+##        --cacert ${SONAR_CERTIFICATE_FILE}'
+#
+#    # append scripts from execute_curl
+#    - *execute_curl
+#
+#    - |
+#
+#      # parse response body using jq and check project status
+#      PROJECT_STATUS=$(echo $RESPONSE_BODY | jq -e '.projectStatus.status' )
+#      echo "Project Status: ${PROJECT_STATUS}"
+#
+#      if [ "${PROJECT_STATUS}" = '"ERROR"' ]; then
+#        echo "Quality Gate Fail"
+#        exit 1
+#      else
+#        echo "Quality Gate Passed"
+#      fi
+#  allow_failure: true
+#  # when: manual
+
+#-------------------------------------------------- BUILD------------------------------------------------#
+
+gradle_build:
+  stage: build
+  needs:
+    # gives gradle_build access to the env variables
+    - setup
+#    # runs test and its subtasks
+#    - gradle_test
+#    # runs sonar and check
+#    - sonar
+  script:
+    # We only need war and assemble task as other tasks are already run on previous jobs
+    # skip processResources and classes as those tasks are already run on gradle_test
+    - ./gradlew war assemble publish -x processResources -x classes
+  artifacts:
+    expire_in: 1 week
+    # pushing the war file as artifact to make it available for next jobs
+    paths:
+      - "${WAR_DIRECTORY}/${TEST_WAR_FILE_NAME}"
+
+#-------------------------------------------------- PUSH TO REGISTRY-----------------------------------------------#
+
+#push_to_gitlab_registry:
+#  stage: push_to_registry
+#  needs:
+#    # needs access to environment variables set in this job
+#    - setup
+#    # needs access to war file
+#    - gradle_build
+#  script:
+#    - ./gradlew build publish
+#    ## curl command to push package to registry
+#    #- |
+#    #  CURL_COMMAND='curl --header "JOB-TOKEN:${CI_JOB_TOKEN}" \
+#    #    --upload-file "${WAR_DIRECTORY}/${TEST_WAR_FILE_NAME}" \
+#    #    "${PACKAGE_REGISTRY_URL}/${GIT_TAG_VERSION}/${PROD_WAR_FILE_NAME}"'
+#
+#    ## We are expecting http status code 201. In execute_curl, we compare the response http status with SUCCESS_STATUS
+#    #- SUCCESS_STATUS=201
+#
+#    ## append scripts from execute_curl
+#    #- *execute_curl
+#  rules:
+#    #run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: on_success
+#    # else never run this job
+#    - when: never
+
+#push_to_nexus_registry:
+#  stage: push_to_registry
+#  needs:
+#    # runs war task which is required by publish task
+#    - gradle_build
+#    # - sonar
+#  before_script: ''
+#    # import certificate from host directory and add it to java keystore in CI environment
+#    # NEXUS_CERTIFICATE_FILE is defined in GitLab CI/CD variable, the host directory is mapped as volume in config.toml file
+#    # - keytool -importcert -keystore ${JAVA_HOME}/lib/security/cacerts -storepass ${JAVA_KEYSTORE_PASS} -file ${NEXUS_CERTIFICATE_FILE}
+#  script:
+#    # by default gradlew publish will run  war task along with other tasks.
+#    # skip war task as it is already run in build job
+#    - ./gradlew publish -x war
+#  rules:
+#    #run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: on_success
+#    # else never run this job
+#    - when: never
+
+#-------------------------------------------------- DEPLOY-----------------------------------------------#
+
+##-----------------------TEST DEPLOY----------------------#
+#
+## Job to deploy latest build to umich test server
+#deploy_umich_test:
+#  extends:
+#    # extends test_deploy_template
+#    - .test_deploy_template
+#  variables:
+#    INSTITUTION: "${UMICH}"
+#    CERTIFICATE_FILE: "${UMICH_TEST_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    #do not run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the UMICH_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $UMICH_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+## Job to deploy latest itm test build to itm test server
+#deploy_itm_test:
+#  extends:
+#    # extends test_deploy_template
+#    - .test_deploy_template
+#  variables:
+#    INSTITUTION: "${ITM}"
+#    CERTIFICATE_FILE: "${ITM_TEST_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    #do not run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the ITM_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $ITM_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+## Job to deploy latest umiami test build to umiami test server
+#deploy_umiami_test:
+#  extends:
+#    # extends test_deploy_template
+#    - .test_deploy_template
+#  variables:
+#    INSTITUTION: "${UMIAMI}"
+#    CERTIFICATE_FILE: "${UMIAMI_TEST_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    #do not run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the UMIAMI_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $UMIAMI_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+## Job to deploy latest uic test build to uic test server
+#deploy_uic_test:
+#  extends:
+#    # extends test_deploy_template
+#    - .test_deploy_template
+#  variables:
+#    INSTITUTION: "${UIC}"
+#    CERTIFICATE_FILE: "${UIC_TEST_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    #do not run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the UIC_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $UIC_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+## Job to deploy latest demo test build to demo test server
+#deploy_demo_test:
+#  extends:
+#    # extends test_deploy_template
+#    - .test_deploy_template
+#  variables:
+#    INSTITUTION: "${DEMO}"
+#    CERTIFICATE_FILE: "${DEMO_TEST_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    #do not run this job if there is a release tag
+#    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+#      when: never
+#    # run this job if the branch to which the commit was pushed to matches the DEMO_WILL_RUN_ON_THIS_BRANCH_OR_TAG
+#    - if: "$CI_COMMIT_REF_NAME == $DEMO_WILL_RUN_ON_THIS_BRANCH_OR_TAG"
+#      when: on_success
+#    #else never run this job
+#    - when: never
+#
+## # ------------------------PRODUCTION DEPLOY----------------------------#
+#
+## Job to pull umich build from package repository and deploy to prod server
+#deploy_umich_prod:
+#  extends:
+#    # extends prod_deploy_template
+#    - .prod_deploy_template
+#  variables:
+#    INSTITUTION: ${UMICH}
+#    CERTIFICATE_FILE: "${UMICH_PROD_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    # run job if release tag is pushed and UMICH_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $UMICH_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      # You have to manually run this job from Gitlab ui
+#      when: manual
+#    #else never run this job
+#    - when: never
+#
+## Job to pull itm build from package repository and deploy to prod server
+#deploy_itm_prod:
+#  extends:
+#    # extends prod_deploy_template
+#    - .prod_deploy_template
+#  variables:
+#    INSTITUTION: ${ITM}
+#    CERTIFICATE_FILE: "${ITM_PROD_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    # run job if release tag is pushed and ITM_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $ITM_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      # You have to manually run this job from Gitlab ui
+#      when: manual
+#    #else never run this job
+#    - when: never
+#
+## Job to pull umiami build from package repository and deploy to prod server
+#deploy_umiami_prod:
+#  extends:
+#    # extends prod_deploy_template
+#    - .prod_deploy_template
+#  variables:
+#    INSTITUTION: ${UMIAMI}
+#    CERTIFICATE_FILE: "${UMIAMI_PROD_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    # run job if release tag is pushed and UMIAMI_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $UMIAMI_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      # You have to manually run this job from Gitlab ui
+#      when: manual
+#    #else never run this job
+#    - when: never
+#
+## Job to pull uic build from package repository and deploy to prod server
+#deploy_uic_prod:
+#  extends:
+#    # extends prod_deploy_template
+#    - .prod_deploy_template
+#  variables:
+#    INSTITUTION: ${UIC}
+#    CERTIFICATE_FILE: "${UIC_PROD_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    # run job if release tag is pushed and UIC_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $UIC_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      # You have to manually run this job from Gitlab ui
+#      when: manual
+#    #else never run this job
+#    - when: never
+#
+## Job to pull demo build from package repository and deploy to prod server
+#deploy_demo_prod:
+#  extends:
+#    # extends prod_deploy_template
+#    - .prod_deploy_template
+#  variables:
+#    INSTITUTION: ${DEMO}
+#    CERTIFICATE_FILE: "${DEMO_PROD_SERVER_CERTIFICATE_FILE}"
+#  rules:
+#    # run job if release tag is pushed and DEMO_WILL_RUN_ON_PRODUCTION is true
+#    - if: "$CI_COMMIT_TAG =~ /^release-.*$/ && $DEMO_WILL_RUN_ON_PRODUCTION =~ /true/i"
+#      # You have to manually run this job from Gitlab ui
+#      when: manual
+#    #else never run this job
+#    - when: never
+
+#-------------------------------------------------- CREATE RELEASE------------------------------------------------#
+
+# JFIXME: should this run before deploy?  Not s
+# Job to create new release in Gitlab
+create_release:
+  stage: release
+  # using this image because it contains release-cli
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    # needs access to env variables
+    - setup
+    # production deployment jobs below send deployment version as environment variables to this stage
+    # these jobs are optional because we are controlling from global variables if these jobs will run on production
+    - job: deploy_umich_prod
+      optional: true
+    - job: deploy_itm_prod
+      optional: true
+    - job: deploy_umiami_prod
+      optional: true
+    - job: deploy_uic_prod
+      optional: true
+    - job: deploy_demo_prod
+      optional: true
+  script:
+    - echo "Releasing Source code and deployed packages"
+  release:
+    name: "Release ${GIT_TAG_VERSION}"
+    tag_name: "${CI_COMMIT_TAG}"
+    description: "Release ${GIT_TAG_VERSION}"
+    ref: "${CI_COMMIT_SHA}"
+    assets:
+      links:
+        # gitlab release does not allow same url for different links
+        # but the link to the deployed package can be same for two or more insititution which will result in an error
+        # to prevent this we add a query param 'env' to differenciate the url, althought the query param is not used for any other purposes
+        - name: "${PROJECT_NAME}-${UMICH}-${UMICH_DEPLOY_VERSION}"
+          url: "${PACKAGE_REGISTRY_URL}/${UMICH_DEPLOY_VERSION}/${PROJECT_NAME}-${UMICH_DEPLOY_VERSION}.war?env=umich"
+          link_type: "package"
+        - name: "${PROJECT_NAME}-${ITM}-${ITM_DEPLOY_VERSION}"
+          url: "${PACKAGE_REGISTRY_URL}/${ITM_DEPLOY_VERSION}/${PROJECT_NAME}-${ITM_DEPLOY_VERSION}.war?env=itm"
+          link_type: "package"
+        - name: "${PROJECT_NAME}-${UMIAMI}-${UMIAMI_DEPLOY_VERSION}"
+          url: "${PACKAGE_REGISTRY_URL}/${UMIAMI_DEPLOY_VERSION}/${PROJECT_NAME}-${UMIAMI_DEPLOY_VERSION}.war?env=umiami"
+          link_type: "package"
+        - name: "${PROJECT_NAME}-${UIC}-${UIC_DEPLOY_VERSION}"
+          url: "${PACKAGE_REGISTRY_URL}/${UIC_DEPLOY_VERSION}/${PROJECT_NAME}-${UIC_DEPLOY_VERSION}.war?env=uic"
+          link_type: "package"
+        - name: "${PROJECT_NAME}-${DEMO}-${DEMO_DEPLOY_VERSION}"
+          url: "${PACKAGE_REGISTRY_URL}/${DEMO_DEPLOY_VERSION}/${PROJECT_NAME}-${DEMO_DEPLOY_VERSION}.war?env=demo"
+          link_type: "package"
+  rules:
+    #run this job if there is a release tag
+    - if: $CI_COMMIT_TAG =~ /^release-.*$/
+      when: on_success
+
+#------------------------------DEVOPS DEPLOYMENT------------------------------------------#
+# HITS_CAMPGROUND corresponds to the cluster we are deploying to. This is
+# dops02nc for non-prod, dops03nc for prod, generally. This overrides these
+# default stages to use the correct campground value
+campsite-diff-prod:
+  variables:
+    HITS_CAMPGROUND: dops03nc
+
+campsite-deploy-prod:
+  variables:
+    HITS_CAMPGROUND: dops03nc
+
+campsite-diff-test:
+  variables:
+    HITS_CAMPGROUND: dops02nc
+
+campsite-deploy-test:
+  variables:
+    HITS_CAMPGROUND: dops02nc
+
+campsite-diff-lab:
+  rules:
+    - when: never
+
+campsite-deploy-lab:
+  rules:
+    - when: never
+
+# JFIXME: remove this after deployment process approved
+".cd-test":
+  rules:
+  - - if: $HITS_DEPLOY == "noop"
+      when: never
+    - if: "$CI_COMMIT_BRANCH == $HITS_DEPLOY_BRANCH && $HITS_DEPLOY =~ /all/"
+  - if: "$CI_COMMIT_BRANCH == $HITS_DEPLOY_BRANCH && $HITS_DEPLOY =~ /test/"
+  - if: "$CI_COMMIT_BRANCH == $HITS_DEPLOY_BRANCH && $HITS_DEPLOY =~ /full/"
+  - if: $CI_COMMIT_BRANCH == $HITS_DEPLOY_BRANCH && $CI_PIPELINE_SOURCE != "web" &&
+      $CI_PIPELINE_SOURCE != "pipeline" && $CI_PIPELINE_SOURCE != "schedule"
+    changes:
+    - "$HELMFILE_PATH_TEST"
+# JFIXME: remove the above after deployment process approved
